@@ -1051,6 +1051,110 @@ async def test_proxy_compact_preflight_permanent_refresh_settles_reservation(asy
 
 
 @pytest.mark.asyncio
+async def test_proxy_compact_preflight_budget_exhausted_settles_reservation(async_client, app_instance, monkeypatch):
+    """Regression: a compact request whose preflight budget check finds the
+    request budget already exhausted MUST settle (release) the API-key usage
+    reservation before raising the budget-exhausted terminal
+    (``upstream_request_timeout``), so held API-key quota is not leaked.
+
+    This drives the REAL sole-settler contract: on the HTTP bridge / forwarded
+    path the caller passes an ``api_key_reservation_override`` with
+    ``owns_reservation`` false, so ``_compact_or_stream_responses`` does NOT
+    release the reservation in its ``finally`` — ``compact_responses`` is the
+    SOLE settler. We reproduce that by creating a REAL ``ApiKeyUsageReservation``
+    (status ``reserved``) via the api-keys service and invoking
+    ``compact_responses`` directly with ``api_key`` + ``api_key_reservation`` (the
+    exact arguments the forwarded route passes), then assert the reservation ROW
+    was actually transitioned to ``released``. The budget-exhausted preflight
+    terminal exits ``compact_responses`` via ``_raise_proxy_budget_exhausted``
+    straight to the outer ``except ProxyResponseError`` handler (which does not
+    settle) and the ``finally`` (which only writes a request log), so before this
+    fix the reservation row stayed ``reserved`` and leaked held API-key quota
+    until it expired. PR #1254 fixed the sibling transport-failure /
+    permanent-refresh preflight raises but left the budget-exhausted terminal out
+    of scope; this completes that invariant.
+    """
+    import app.modules.proxy._service.compact as compact_module
+    from app.core.openai.requests import ResponsesCompactRequest
+    from app.db.models import ApiKeyUsageReservation
+    from app.dependencies import get_proxy_service_for_app
+    from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService, LimitRuleInput
+    from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
+
+    email = "compact-preflight-budget-exhausted@example.com"
+    raw_account_id = "acc_compact_preflight_budget_exhausted"
+    auth_json = _make_auth_json(raw_account_id, email)
+    response = await async_client.post(
+        "/api/accounts/import",
+        files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")},
+    )
+    assert response.status_code == 200
+
+    # Create a real API key with a token limit so enforcement reserves genuine
+    # held quota, then create a real reservation row (status "reserved").
+    async with SessionLocal() as session:
+        api_keys_service = ApiKeysService(ApiKeysRepository(session))
+        created = await api_keys_service.create_key(
+            ApiKeyCreateData(
+                name="compact-budget-exhausted",
+                allowed_models=None,
+                limits=[LimitRuleInput(limit_type="total_tokens", limit_window="daily", max_value=1_000_000)],
+            )
+        )
+    key_id = created.id
+
+    payload = ResponsesCompactRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": []})
+
+    async with SessionLocal() as session:
+        api_keys_service = ApiKeysService(ApiKeysRepository(session))
+        api_key = await api_keys_service.get_key_by_id(key_id)
+        reservation = await api_keys_service.enforce_limits_for_request(
+            key_id,
+            request_model=payload.model,
+            request_service_tier=None,
+            request_usage_budget=estimate_api_key_request_usage(payload),
+        )
+
+    # Sanity: the reservation starts held ("reserved") before the request runs.
+    async with SessionLocal() as session:
+        row = await session.get(ApiKeyUsageReservation, reservation.reservation_id)
+        assert row is not None
+        assert row.status == "reserved"
+
+    # Force the compact request budget to read as exhausted at every preflight
+    # check. Account selection uses the real deadline (service.py), so a healthy
+    # account is still selected; the first compact-module budget check (before the
+    # freshness preflight) then trips the budget-exhausted terminal before any
+    # upstream/freshness work runs.
+    monkeypatch.setattr(compact_module, "_remaining_budget_seconds", lambda deadline: 0.0)
+
+    # Invoke the sole-settler path directly with the forwarded arguments
+    # (owns_reservation false ⇒ compact_responses owns the settlement). Do NOT
+    # mock _settle_compact_api_key_usage: we assert the REAL reservation row is
+    # released, which a mock could not prove.
+    proxy_service = get_proxy_service_for_app(app_instance)
+    with pytest.raises(ProxyResponseError) as excinfo:
+        await proxy_service.compact_responses(
+            payload,
+            {},
+            api_key=api_key,
+            api_key_reservation=reservation,
+        )
+
+    # Budget exhaustion surfaces as a 502 upstream_request_timeout.
+    assert excinfo.value.status_code == 502
+    assert excinfo.value.payload["error"]["code"] == "upstream_request_timeout"
+
+    # The reservation ROW was actually released before the terminal raised (the
+    # fix): pre-fix the terminal raised without settling, so the row stayed
+    # "reserved" and leaked held API-key quota on the bridge/forwarded path.
+    async with SessionLocal() as session:
+        row = await session.get(ApiKeyUsageReservation, reservation.reservation_id)
+        assert row is not None
+        assert row.status == "released", f"reservation leaked held quota; status={row.status!r}"
+
+
+@pytest.mark.asyncio
 async def test_proxy_compact_retryable_transport_failure_retries_same_contract_only(async_client, monkeypatch):
     email = "compact-safe-retry@example.com"
     raw_account_id = "acc_compact_safe_retry"
