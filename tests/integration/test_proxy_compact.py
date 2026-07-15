@@ -1076,7 +1076,6 @@ async def test_proxy_compact_preflight_budget_exhausted_settles_reservation(asyn
     """
     import app.modules.proxy._service.compact as compact_module
     from app.core.openai.requests import ResponsesCompactRequest
-    from app.db.models import ApiKeyUsageReservation
     from app.dependencies import get_proxy_service_for_app
     from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService, LimitRuleInput
     from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
@@ -1098,7 +1097,7 @@ async def test_proxy_compact_preflight_budget_exhausted_settles_reservation(asyn
             ApiKeyCreateData(
                 name="compact-budget-exhausted",
                 allowed_models=None,
-                limits=[LimitRuleInput(limit_type="total_tokens", limit_window="daily", max_value=1_000_000)],
+                limits=[LimitRuleInput(limit_type="total_tokens", limit_window="daily", max_value=100)],
             )
         )
     key_id = created.id
@@ -1117,9 +1116,13 @@ async def test_proxy_compact_preflight_budget_exhausted_settles_reservation(asyn
 
     # Sanity: the reservation starts held ("reserved") before the request runs.
     async with SessionLocal() as session:
-        row = await session.get(ApiKeyUsageReservation, reservation.reservation_id)
+        api_keys_repository = ApiKeysRepository(session)
+        row = await api_keys_repository.get_usage_reservation(reservation.reservation_id)
+        limits = await api_keys_repository.get_limits_by_key(key_id)
         assert row is not None
         assert row.status == "reserved"
+        assert len(limits) == 1
+        assert limits[0].current_value == 100
 
     # Force the compact request budget to read as exhausted at every preflight
     # check. Account selection uses the real deadline (service.py), so a healthy
@@ -1149,9 +1152,93 @@ async def test_proxy_compact_preflight_budget_exhausted_settles_reservation(asyn
     # fix): pre-fix the terminal raised without settling, so the row stayed
     # "reserved" and leaked held API-key quota on the bridge/forwarded path.
     async with SessionLocal() as session:
-        row = await session.get(ApiKeyUsageReservation, reservation.reservation_id)
+        api_keys_repository = ApiKeysRepository(session)
+        row = await api_keys_repository.get_usage_reservation(reservation.reservation_id)
+        limits = await api_keys_repository.get_limits_by_key(key_id)
         assert row is not None
         assert row.status == "released", f"reservation leaked held quota; status={row.status!r}"
+        assert len(limits) == 1
+        assert limits[0].current_value == 0
+
+        api_keys_service = ApiKeysService(api_keys_repository)
+        next_reservation = await api_keys_service.enforce_limits_for_request(
+            key_id,
+            request_model=payload.model,
+            request_service_tier=None,
+            request_usage_budget=estimate_api_key_request_usage(payload),
+        )
+        assert next_reservation.reservation_id != reservation.reservation_id
+        await api_keys_service.release_usage_reservation(next_reservation.reservation_id)
+
+
+@pytest.mark.parametrize(
+    ("terminal", "remaining_budgets", "zero_freshness_budget", "expected_freshness_calls", "expected_upstream_calls"),
+    [
+        pytest.param("before_freshness_reserve", (10.0,), True, 0, 0, id="before-freshness-reserve"),
+        pytest.param("after_freshness", (10.0, 0.0), False, 1, 0, id="after-freshness"),
+        pytest.param("before_forced_refresh", (10.0, 10.0, 10.0, 10.0, 0.0), False, 1, 1, id="post-401"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_proxy_compact_remaining_budget_terminals_settle_once(
+    async_client,
+    monkeypatch,
+    terminal,
+    remaining_budgets,
+    zero_freshness_budget,
+    expected_freshness_calls,
+    expected_upstream_calls,
+):
+    """The three sibling preflight budget terminals preserve the public error
+    while settling before they bypass the retry-loop handlers."""
+    import app.modules.proxy._service.compact as compact_module
+
+    email = f"compact-budget-{terminal}@example.com"
+    raw_account_id = f"acc_compact_budget_{terminal}"
+    auth_json = _make_auth_json(raw_account_id, email)
+    response = await async_client.post(
+        "/api/accounts/import",
+        files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")},
+    )
+    assert response.status_code == 200
+
+    budget_values = iter(remaining_budgets)
+    monkeypatch.setattr(compact_module, "_remaining_budget_seconds", lambda _deadline: next(budget_values))
+    if zero_freshness_budget:
+        monkeypatch.setattr(compact_module, "_compact_freshness_budget_seconds", lambda _remaining: 0.0)
+
+    freshness_calls: list[bool] = []
+
+    async def fake_ensure_fresh(self, account, *, force: bool = False, timeout_seconds=None):
+        del self, timeout_seconds
+        freshness_calls.append(force)
+        return account
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh)
+
+    upstream_compact = AsyncMock()
+    if terminal == "before_forced_refresh":
+        upstream_compact.side_effect = ProxyResponseError(
+            401,
+            openai_error("invalid_api_key", "token expired", error_type="authentication_error"),
+        )
+    monkeypatch.setattr(proxy_module, "core_compact_responses", upstream_compact)
+
+    settle_compact_usage = AsyncMock()
+    monkeypatch.setattr(proxy_module.ProxyService, "_settle_compact_api_key_usage", settle_compact_usage)
+
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": []}
+    response = await async_client.post("/backend-api/codex/responses/compact", json=payload)
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_request_timeout"
+    settle_compact_usage.assert_awaited_once()
+    settle_call = settle_compact_usage.await_args
+    assert settle_call is not None
+    assert settle_call.kwargs["response"] is None
+    assert freshness_calls == [False] * expected_freshness_calls
+    assert upstream_compact.await_count == expected_upstream_calls
+    assert list(budget_values) == []
 
 
 @pytest.mark.asyncio

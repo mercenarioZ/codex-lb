@@ -27,21 +27,21 @@ This is the same class of leak #1254 fixed for the transport/permanent siblings.
   settle the reservation (release it via `_settle_compact_api_key_usage`) BEFORE
   `_raise_proxy_budget_exhausted()`, mirroring the neighboring
   transport/permanent/claim-contention branches. This covers the three
-  preflight/retry terminals reached with an unsettled reservation: the
-  before-freshness-check budget terminal, the after-freshness-check budget
-  terminal, and the post-401 forced-refresh preflight budget terminal.
+  preflight/retry terminals reached with an unsettled reservation: before the
+  freshness check, before the freshness-check reserve, after the freshness
+  check, and before the post-401 forced-refresh retry.
 - The inner `_call_compact` budget terminals are deliberately left unchanged:
   their `ProxyResponseError(upstream_request_timeout)` is caught by the enclosing
   retry-loop `except ProxyResponseError` handler, which already settles the
   reservation on the `upstream_request_timeout` / account-neutral branches before
   raising. Adding a settle there would double-settle.
 - Existing `release_account_lease` calls are preserved.
-- Spec delta in `usage-refresh-policy` (completing the compact preflight
+- Spec delta in `api-keys` (completing the compact preflight
   reservation-settlement invariant for the budget-exhausted terminal); a
   route-level regression test on the compact responses harness.
 
 ## Impact
 
-- Affected specs: `usage-refresh-policy`
+- Affected specs: `api-keys`
 - Affected code: `app/modules/proxy/_service/compact.py`
 - Affected tests: `tests/integration/test_proxy_compact.py`
